@@ -48,7 +48,7 @@
  */
 void 
 fluid_iir_filter_apply(fluid_iir_filter_t* iir_filter,
-                       fluid_real_t *dsp_buf, int count)
+                       fluid_real_t *FLUID_RESTRICT dsp_buf, int count)
 {
   if(iir_filter->type == FLUID_IIR_DISABLED || iir_filter->q_lin == 0)
   {
@@ -67,8 +67,7 @@ fluid_iir_filter_apply(fluid_iir_filter_t* iir_filter,
   fluid_real_t dsp_b1 = iir_filter->b1;
   int dsp_filter_coeff_incr_count = iir_filter->filter_coeff_incr_count;
 
-  fluid_real_t dsp_centernode;
-  int dsp_i;
+  int dsp_i, ii;
 
   /* filter (implement the voice filter according to SoundFont standard) */
 
@@ -92,7 +91,7 @@ fluid_iir_filter_apply(fluid_iir_filter_t* iir_filter,
     for (dsp_i = 0; dsp_i < count; dsp_i++)
     {
       /* The filter is implemented in Direct-II form. */
-      dsp_centernode = dsp_buf[dsp_i] - dsp_a1 * dsp_hist1 - dsp_a2 * dsp_hist2;
+      fluid_real_t dsp_centernode = dsp_buf[dsp_i] - dsp_a1 * dsp_hist1 - dsp_a2 * dsp_hist2;
       dsp_buf[dsp_i] = dsp_b02 * (dsp_centernode + dsp_hist2) + dsp_b1 * dsp_hist1;
       dsp_hist2 = dsp_hist1;
       dsp_hist1 = dsp_centernode;
@@ -114,8 +113,65 @@ fluid_iir_filter_apply(fluid_iir_filter_t* iir_filter,
       }
     } /* for dsp_i */
   }
-  else /* The filter parameters are constant.  This is duplicated to save time. */
+  else /* The filter parameters are constant. */
   {
+      enum { UNROLL_FACTOR = 4, N_COEFFS = 6 };
+      
+    double coeffs[UNROLL_FACTOR][N_COEFFS] = 
+    {
+        /* assume x0 = dsp_buf[0]
+         * x3 x2  x1  x0  dsp_hist1  dsp_hist2 */
+        {  0,  0,  0,  1,  -dsp_a1,  -dsp_a2}, /* = dsp_centernode[0] */
+        {  0,  0,  1,  0,  -dsp_a2,        0}, /* = dsp_centernode[1] */
+        {  0,  1,  0,  0,        0,        0}, /* = dsp_centernode[2] */
+        {  1,  0,  0,  0,        0,        0}, /* = dsp_centernode[3] */
+    };
+
+    #pragma omp simd aligned(coeffs:FLUID_DEFAULT_ALIGNMENT)
+    for (ii = 0; ii < N_COEFFS; ii++)
+    {
+        // dsp_centernode[1] needs -a1*dsp_centernode[0]
+        coeffs[1][ii] += -dsp_a1 * coeffs[0][ii];
+        // dsp_centernode[2] needs -a1*dsp_centernode[1] - a2*dsp_centernode[0]
+        coeffs[2][ii] += -dsp_a1 * coeffs[1][ii] - dsp_a2 * coeffs[0][ii];
+        // dsp_centernode[3] needs -a1*dsp_centernode[2] - a2*dsp_centernode[1]
+        coeffs[3][ii] += -dsp_a1 * coeffs[2][ii] - dsp_a2 * coeffs[1][ii];
+    }
+    
+    for (dsp_i = 0; dsp_i < count; dsp_i+=UNROLL_FACTOR)
+    {
+        float dsp_centernode[UNROLL_FACTOR] = {0};
+        
+        // this calculates  dsp_centernode = dsp_buf[dsp_i] - dsp_a1 * dsp_hist1 - dsp_a2 * dsp_hist2
+        // for UNROLL_FACTOR unrolled dsp_centernodes
+        #pragma omp simd aligned(dsp_buf,coeffs,dsp_centernode:FLUID_DEFAULT_ALIGNMENT)
+        for(ii = 0; ii < UNROLL_FACTOR; ii++)
+        {
+            dsp_centernode[ii] += coeffs[ii][0] * dsp_buf[dsp_i + 3]; // x3
+            dsp_centernode[ii] += coeffs[ii][1] * dsp_buf[dsp_i + 2]; // x2
+            dsp_centernode[ii] += coeffs[ii][2] * dsp_buf[dsp_i + 1]; // x1
+            dsp_centernode[ii] += coeffs[ii][3] * dsp_buf[dsp_i + 0]; // x0
+            
+            dsp_centernode[ii] += coeffs[ii][4] * dsp_hist1; // y-1
+            dsp_centernode[ii] += coeffs[ii][5] * dsp_hist2; // y-2
+        }
+        
+        fluid_real_t dsp_hist1_vec[UNROLL_FACTOR] = { dsp_hist1, dsp_centernode[0], dsp_centernode[1], dsp_centernode[2]};
+        fluid_real_t dsp_hist2_vec[UNROLL_FACTOR] = { dsp_hist2, dsp_hist1, dsp_centernode[0], dsp_centernode[1]};
+        
+        #pragma omp simd aligned(dsp_buf,dsp_centernode:FLUID_DEFAULT_ALIGNMENT)
+        for (ii = 0; ii < UNROLL_FACTOR; ii++)
+        { /* The filter is implemented in Direct-II form. */
+            dsp_buf[dsp_i] = dsp_b02 * (dsp_centernode[ii] + dsp_hist2_vec[ii]) + dsp_b1 * dsp_hist1_vec[ii];
+        }
+        
+        dsp_hist2 = dsp_centernode[2];
+        dsp_hist1 = dsp_centernode[3];
+    }
+    
+#if 0
+// naive DF2 IIR filter impl.:
+
     for (dsp_i = 0; dsp_i < count; dsp_i++)
     { /* The filter is implemented in Direct-II form. */
       dsp_centernode = dsp_buf[dsp_i] - dsp_a1 * dsp_hist1 - dsp_a2 * dsp_hist2;
@@ -123,6 +179,7 @@ fluid_iir_filter_apply(fluid_iir_filter_t* iir_filter,
       dsp_hist2 = dsp_hist1;
       dsp_hist1 = dsp_centernode;
     }
+#endif 
   }
 
   iir_filter->hist1 = dsp_hist1;
